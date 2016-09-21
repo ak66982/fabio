@@ -30,7 +30,7 @@ import (
 // It is also set by the linker when fabio
 // is built via the Makefile or the build/docker.sh
 // script to ensure the correct version nubmer
-var version = "1.2"
+var version = "1.3.2"
 
 func main() {
 	cfg, err := config.Load()
@@ -53,16 +53,19 @@ func main() {
 		registry.Default.Deregister()
 	})
 
+	httpProxy := newHTTPProxy(cfg)
+	tcpProxy := proxy.NewTCPSNIProxy(cfg.Proxy)
+
 	initRuntime(cfg)
 	initMetrics(cfg)
 	initBackend(cfg)
 	go watchBackend()
 	startAdmin(cfg)
-	startListeners(cfg.Listen, cfg.Proxy.ShutdownWait, newProxy(cfg))
+	startListeners(cfg.Listen, cfg.Proxy.ShutdownWait, httpProxy, tcpProxy)
 	exit.Wait()
 }
 
-func newProxy(cfg *config.Config) *proxy.Proxy {
+func newHTTPProxy(cfg *config.Config) http.Handler {
 	if err := route.SetPickerStrategy(cfg.Proxy.Strategy); err != nil {
 		exit.Fatal("[FATAL] ", err)
 	}
@@ -82,7 +85,7 @@ func newProxy(cfg *config.Config) *proxy.Proxy {
 		}).Dial,
 	}
 
-	return proxy.New(tr, cfg.Proxy)
+	return proxy.NewHTTPProxy(tr, cfg.Proxy)
 }
 
 func startAdmin(cfg *config.Config) {
@@ -95,7 +98,16 @@ func startAdmin(cfg *config.Config) {
 }
 
 func initMetrics(cfg *config.Config) {
-	if err := metrics.Init(cfg.Metrics); err != nil {
+	if cfg.Metrics.Target == "" {
+		log.Printf("[INFO] Metrics disabled")
+		return
+	}
+
+	var err error
+	if metrics.DefaultRegistry, err = metrics.NewRegistry(cfg.Metrics); err != nil {
+		exit.Fatal("[FATAL] ", err)
+	}
+	if route.ServiceRegistry, err = metrics.NewRegistry(cfg.Metrics); err != nil {
 		exit.Fatal("[FATAL] ", err)
 	}
 }

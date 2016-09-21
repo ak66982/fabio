@@ -21,6 +21,9 @@ var errNoMatch = errors.New("route: no target match")
 // table stores the active routing table. Must never be nil.
 var table atomic.Value
 
+// ServiceRegistry stores the metrics for the services.
+var ServiceRegistry metrics.Registry = metrics.NoopRegistry{}
+
 // init initializes the routing table.
 func init() {
 	table.Store(make(Table))
@@ -58,9 +61,9 @@ func syncRegistry(t Table) {
 	timers := map[string]bool{}
 
 	// get all registered timers
-	metrics.ServiceRegistry.Each(func(name string, m interface{}) {
+	for _, name := range ServiceRegistry.Names() {
 		timers[name] = false
-	})
+	}
 
 	// mark the ones from this table as active.
 	// this can also add new entries but we do not
@@ -77,7 +80,7 @@ func syncRegistry(t Table) {
 	// unregister inactive timers
 	for name, active := range timers {
 		if !active {
-			metrics.ServiceRegistry.Unregister(name)
+			ServiceRegistry.Unregister(name)
 			log.Printf("[INFO] Unregistered timer %s", name)
 		}
 	}
@@ -247,9 +250,9 @@ func (t Table) Lookup(req *http.Request, trace string) *Target {
 		log.Printf("[TRACE] %s Tracing %s%s", trace, req.Host, req.RequestURI)
 	}
 
-	target := t.doLookup(normalizeHost(req), req.RequestURI, trace)
+	target := t.lookup(normalizeHost(req), req.RequestURI, trace)
 	if target == nil {
-		target = t.doLookup("", req.RequestURI, trace)
+		target = t.lookup("", req.RequestURI, trace)
 	}
 
 	if target != nil && trace != "" {
@@ -259,7 +262,11 @@ func (t Table) Lookup(req *http.Request, trace string) *Target {
 	return target
 }
 
-func (t Table) doLookup(host, path, trace string) *Target {
+func (t Table) LookupHost(host string) *Target {
+	return t.lookup(host, "/", "")
+}
+
+func (t Table) lookup(host, path, trace string) *Target {
 	for _, r := range t[host] {
 		if match(path, r) {
 			n := len(r.Targets)

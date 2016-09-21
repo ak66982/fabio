@@ -1,11 +1,30 @@
 ## Changelog
 
-### Unreleased
+### [v1.3.2](https://github.com/eBay/fabio/releases/tag/v1.3.1) - 11 Sep 2016
+
+ * [Issue #159](https://github.com/eBay/fabio/issues/159): Panic on invalid response
+
+### [v1.3.1](https://github.com/eBay/fabio/releases/tag/v1.3.1) - 9 Sep 2016
+
+ * [Issue #157](https://github.com/eBay/fabio/issues/157): ParseListen may set the wrong protocol
+
+### [v1.3](https://github.com/eBay/fabio/releases/tag/v1.3) - 9 Sep 2016
+
+ * [Issue #1](https://github.com/eBay/fabio/issues/1): Add TCP proxy with SNI support (EXPERIMENTAL)
+ * [Issue #125](https://github.com/eBay/fabio/issues/125): Extended metrics
+ * [Issue #134](https://github.com/eBay/fabio/issues/134): Vault token should not require 'root' or 'sudo' privileges
+ * [Issue #138](https://github.com/eBay/fabio/issues/138): Add option to disable cert fallback
+ * [Issue #147](https://github.com/eBay/fabio/issues/147): Support multiple metrics libraries
+ * [Issue #151](https://github.com/eBay/fabio/issues/151)/[PR #150](https://github.com/eBay/fabio/pull/150): Add support for Circonus metrics
+ * [PR #154](https://github.com/eBay/fabio/pull/154): Make route metric names configurable
+
+### [v1.2.1](https://github.com/eBay/fabio/releases/tag/v1.2.1) - 25 Aug 2016
 
  * [Issue #73](https://github.com/eBay/fabio/pull/73)/[PR #139](https://github.com/eBay/fabio/pull/139): Add statsd support
  * [Issue #129](https://github.com/eBay/fabio/issues/129): Server-sent events support
  * [Issue #136](https://github.com/eBay/fabio/issues/136): Always deregister from consul
  * [PR #143](https://github.com/eBay/fabio/pull/143): Improve error message on missing trailing slash
+ * [Issue #146](https://github.com/eBay/fabio/issues/146): fabio fails to start with "[FATAL] 1.2. missing 'cs' in cs"
 
 ### [v1.2](https://github.com/eBay/fabio/releases/tag/v1.2) - 16 Jul 2016
 

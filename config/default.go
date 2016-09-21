@@ -40,8 +40,10 @@ var Default = &Config{
 		Color: "light-green",
 	},
 	Metrics: Metrics{
-		Prefix:   "default",
-		Interval: 30 * time.Second,
+		Prefix:         "{{clean .Hostname}}.{{clean .Exec}}",
+		Names:          "{{clean .Service}}.{{clean .Host}}.{{clean .Path}}.{{clean .TargetURL.Host}}",
+		Interval:       30 * time.Second,
+		CirconusAPIApp: "fabio",
 	},
 	CertSources: map[string]CertSource{},
 }

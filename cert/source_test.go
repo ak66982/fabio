@@ -89,7 +89,7 @@ func TestNewSource(t *testing.T) {
 		},
 		{
 			cfg: certsource("vault"),
-			src: VaultSource{
+			src: &VaultSource{
 				CertPath:     "cert",
 				ClientCAPath: "clientca",
 				CAUpgradeCN:  "upgcn",
@@ -128,7 +128,7 @@ func (s StaticSource) LoadClientCAs() (*x509.CertPool, error) {
 }
 
 func TestStaticSource(t *testing.T) {
-	certPEM, keyPEM := makeCert("localhost", time.Minute)
+	certPEM, keyPEM := makePEM("localhost", time.Minute)
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		t.Fatalf("X509KeyPair: got %s want nil", err)
@@ -139,7 +139,7 @@ func TestStaticSource(t *testing.T) {
 func TestFileSource(t *testing.T) {
 	dir := tempDir()
 	defer os.RemoveAll(dir)
-	certPEM, keyPEM := makeCert("localhost", time.Minute)
+	certPEM, keyPEM := makePEM("localhost", time.Minute)
 	certFile, keyFile := saveCert(dir, "localhost", certPEM, keyPEM)
 	testSource(t, FileSource{CertFile: certFile, KeyFile: keyFile}, makeCertPool(certPEM), 0)
 }
@@ -147,7 +147,7 @@ func TestFileSource(t *testing.T) {
 func TestPathSource(t *testing.T) {
 	dir := tempDir()
 	defer os.RemoveAll(dir)
-	certPEM, keyPEM := makeCert("localhost", time.Minute)
+	certPEM, keyPEM := makePEM("localhost", time.Minute)
 	saveCert(dir, "localhost", certPEM, keyPEM)
 	testSource(t, PathSource{CertPath: dir}, makeCertPool(certPEM), 0)
 }
@@ -155,7 +155,7 @@ func TestPathSource(t *testing.T) {
 func TestHTTPSource(t *testing.T) {
 	dir := tempDir()
 	defer os.RemoveAll(dir)
-	certPEM, keyPEM := makeCert("localhost", time.Minute)
+	certPEM, keyPEM := makePEM("localhost", time.Minute)
 	certFile, keyFile := saveCert(dir, "localhost", certPEM, keyPEM)
 	listFile := filepath.Base(certFile) + "\n" + filepath.Base(keyFile) + "\n"
 	writeFile(filepath.Join(dir, "list"), []byte(listFile))
@@ -163,7 +163,7 @@ func TestHTTPSource(t *testing.T) {
 	srv := httptest.NewServer(http.FileServer(http.Dir(dir)))
 	defer srv.Close()
 
-	testSource(t, HTTPSource{CertURL: srv.URL + "/list"}, makeCertPool(certPEM), 50*time.Millisecond)
+	testSource(t, HTTPSource{CertURL: srv.URL + "/list"}, makeCertPool(certPEM), 500*time.Millisecond)
 }
 
 func TestConsulSource(t *testing.T) {
@@ -212,31 +212,24 @@ func TestConsulSource(t *testing.T) {
 		}
 	}
 
-	certPEM, keyPEM := makeCert("localhost", time.Minute)
+	certPEM, keyPEM := makePEM("localhost", time.Minute)
 	write("localhost-cert.pem", certPEM)
 	write("localhost-key.pem", keyPEM)
 
-	testSource(t, ConsulSource{CertURL: certURL}, makeCertPool(certPEM), 50*time.Millisecond)
+	testSource(t, ConsulSource{CertURL: certURL}, makeCertPool(certPEM), 500*time.Millisecond)
 }
 
-func TestVaultSource(t *testing.T) {
-	const (
-		addr      = "127.0.0.1:58421"
-		rootToken = "token"
-		certPath  = "secret/fabio/cert"
-	)
-
-	// run a vault server in dev mode
-	t.Log("Starting vault server")
-	vault := exec.Command("vault", "server", "-dev", "-dev-root-token-id="+rootToken, "-dev-listen-address="+addr)
-	if err := vault.Start(); err != nil {
+// vaultServer starts a vault server in dev mode and waits
+// until is ready.
+func vaultServer(t *testing.T, addr, rootToken string) (*exec.Cmd, *vaultapi.Client) {
+	cmd := exec.Command("vault", "server", "-dev", "-dev-root-token-id="+rootToken, "-dev-listen-address="+addr)
+	if err := cmd.Start(); err != nil {
 		t.Fatalf("Failed to start vault server. %s", err)
 	}
-	defer vault.Process.Kill()
 
-	// create a vault client for that server
 	c, err := vaultapi.NewClient(&vaultapi.Config{Address: "http://" + addr})
 	if err != nil {
+		cmd.Process.Kill()
 		t.Fatalf("NewClient failed: %s", err)
 	}
 	c.SetToken(rootToken)
@@ -246,24 +239,115 @@ func TestVaultSource(t *testing.T) {
 		return err == nil && ok
 	}
 	if !waitFor(time.Second, isUp) {
+		cmd.Process.Kill()
 		t.Fatal("Timeout waiting for vault server")
 	}
 
-	// create a renewable token since the vault source
-	// will renew the token on every request
-	tok, err := c.Auth().Token().Create(&vaultapi.TokenCreateRequest{NoParent: true, TTL: "1h"})
-	if err != nil {
-		t.Fatalf("Token.Create failed: %s", err)
+	policy := `
+	path "secret/fabio/cert" {
+	  capabilities = ["list"]
 	}
 
+	path "secret/fabio/cert/*" {
+	  capabilities = ["read"]
+	}
+	`
+
+	if err := c.Sys().PutPolicy("fabio", policy); err != nil {
+		cmd.Process.Kill()
+		t.Fatalf("Could not create policy: %s", err)
+	}
+
+	return cmd, c
+}
+
+func makeToken(t *testing.T, c *vaultapi.Client, wrapTTL string, req *vaultapi.TokenCreateRequest) string {
+	c.SetWrappingLookupFunc(func(string, string) string { return wrapTTL })
+
+	resp, err := c.Auth().Token().Create(req)
+	if err != nil {
+		t.Fatalf("Could not create a token: %s", err)
+	}
+
+	if wrapTTL != "" {
+		if resp.WrapInfo == nil || resp.WrapInfo.Token == "" {
+			t.Fatalf("Could not create a wrapped token")
+		}
+		return resp.WrapInfo.Token
+	}
+
+	if resp.WrapInfo != nil && resp.WrapInfo.Token != "" {
+		t.Fatalf("Got a wrapped token but was not expecting one")
+	}
+
+	return resp.Auth.ClientToken
+}
+
+func TestVaultSource(t *testing.T) {
+	const (
+		addr      = "127.0.0.1:58421"
+		rootToken = "token"
+		certPath  = "secret/fabio/cert"
+	)
+
+	// start a vault server
+	vault, client := vaultServer(t, addr, rootToken)
+	defer vault.Process.Kill()
+
 	// create a cert and store it in vault
-	certPEM, keyPEM := makeCert("localhost", time.Minute)
+	certPEM, keyPEM := makePEM("localhost", time.Minute)
 	data := map[string]interface{}{"cert": string(certPEM), "key": string(keyPEM)}
-	if _, err := c.Logical().Write(certPath+"/localhost", data); err != nil {
+	if _, err := client.Logical().Write(certPath+"/localhost", data); err != nil {
 		t.Fatalf("logical.Write failed: %s", err)
 	}
 
-	testSource(t, VaultSource{Addr: "http://" + addr, token: tok.Auth.ClientToken, CertPath: certPath}, makeCertPool(certPEM), 50*time.Millisecond)
+	newBool := func(b bool) *bool { return &b }
+
+	// run tests
+	tests := []struct {
+		desc    string
+		wrapTTL string
+		req     *vaultapi.TokenCreateRequest
+	}{
+		{
+			desc: "renewable token",
+			req:  &vaultapi.TokenCreateRequest{Lease: "1m", TTL: "1m", Policies: []string{"fabio"}},
+		},
+		{
+			desc: "non-renewable token",
+			req:  &vaultapi.TokenCreateRequest{Lease: "1m", TTL: "1m", Renewable: newBool(false), Policies: []string{"fabio"}},
+		},
+		{
+			desc: "renewable orphan token",
+			req:  &vaultapi.TokenCreateRequest{Lease: "1m", TTL: "1m", NoParent: true, Policies: []string{"fabio"}},
+		},
+		{
+			desc: "non-renewable orphan token",
+			req:  &vaultapi.TokenCreateRequest{Lease: "1m", TTL: "1m", NoParent: true, Renewable: newBool(false), Policies: []string{"fabio"}},
+		},
+		{
+			desc:    "renewable wrapped token",
+			wrapTTL: "10s",
+			req:     &vaultapi.TokenCreateRequest{Lease: "1m", TTL: "1m", Policies: []string{"fabio"}},
+		},
+		{
+			desc:    "non-renewable wrapped token",
+			wrapTTL: "10s",
+			req:     &vaultapi.TokenCreateRequest{Lease: "1m", TTL: "1m", Renewable: newBool(false), Policies: []string{"fabio"}},
+		},
+	}
+
+	pool := makeCertPool(certPEM)
+	timeout := 50 * time.Millisecond
+	for _, tt := range tests {
+		t.Log("Test vault source with", tt.desc)
+		src := &VaultSource{
+			Addr:       "http://" + addr,
+			CertPath:   certPath,
+			vaultToken: makeToken(t, client, tt.wrapTTL, tt.req),
+		}
+		testSource(t, src, pool, timeout)
+	}
 }
 
 // testSource runs an integration test by making an HTTPS request
@@ -273,7 +357,8 @@ func TestVaultSource(t *testing.T) {
 // the HTTPS client can validate the certificate presented by the
 // server.
 func testSource(t *testing.T, source Source, rootCAs *x509.CertPool, sleep time.Duration) {
-	srvConfig, err := TLSConfig(source)
+	const NoStrictMatch = false
+	srvConfig, err := TLSConfig(source, NoStrictMatch)
 	if err != nil {
 		t.Fatalf("TLSConfig: got %q want nil", err)
 	}
@@ -374,9 +459,9 @@ func saveCert(dir, host string, certPEM, keyPEM []byte) (certFile, keyFile strin
 	return certFile, keyFile
 }
 
-// makeCert creates a self-signed RSA certificate.
+// makePEM creates a self-signed RSA certificate as two PEM blocks.
 // taken from crypto/tls/generate_cert.go
-func makeCert(host string, validFor time.Duration) (certPEM, keyPEM []byte) {
+func makePEM(host string, validFor time.Duration) (certPEM, keyPEM []byte) {
 	const bits = 1024
 	priv, err := rsa.GenerateKey(rand.Reader, bits)
 	if err != nil {
@@ -406,6 +491,15 @@ func makeCert(host string, validFor time.Duration) (certPEM, keyPEM []byte) {
 	pem.Encode(&cert, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	pem.Encode(&key, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)})
 	return cert.Bytes(), key.Bytes()
+}
+
+func makeCert(host string, validFor time.Duration) tls.Certificate {
+	certPEM, keyPEM := makePEM(host, validFor)
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		panic("Failed to create certificate: " + err.Error())
+	}
+	return cert
 }
 
 func waitFor(timeout time.Duration, up func() bool) bool {

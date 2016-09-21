@@ -107,9 +107,15 @@ func load(p *properties.Properties) (cfg *Config, err error) {
 	f.DurationVar(&cfg.Proxy.FlushInterval, "proxy.flushinterval", Default.Proxy.FlushInterval, "flush interval for streaming responses")
 	f.StringVar(&cfg.Metrics.Target, "metrics.target", Default.Metrics.Target, "metrics backend")
 	f.StringVar(&cfg.Metrics.Prefix, "metrics.prefix", Default.Metrics.Prefix, "prefix for reported metrics")
+	f.StringVar(&cfg.Metrics.Names, "metrics.names", Default.Metrics.Names, "route metric name template")
 	f.DurationVar(&cfg.Metrics.Interval, "metrics.interval", Default.Metrics.Interval, "metrics reporting interval")
 	f.StringVar(&cfg.Metrics.GraphiteAddr, "metrics.graphite.addr", Default.Metrics.GraphiteAddr, "graphite server address")
 	f.StringVar(&cfg.Metrics.StatsDAddr, "metrics.statsd.addr", Default.Metrics.StatsDAddr, "statsd server address")
+	f.StringVar(&cfg.Metrics.CirconusAPIKey, "metrics.circonus.apikey", Default.Metrics.CirconusAPIKey, "Circonus API token key")
+	f.StringVar(&cfg.Metrics.CirconusAPIApp, "metrics.circonus.apiapp", Default.Metrics.CirconusAPIApp, "Circonus API token app")
+	f.StringVar(&cfg.Metrics.CirconusAPIURL, "metrics.circonus.apiurl", Default.Metrics.CirconusAPIURL, "Circonus API URL")
+	f.StringVar(&cfg.Metrics.CirconusBrokerID, "metrics.circonus.brokerid", Default.Metrics.CirconusBrokerID, "Circonus Broker ID")
+	f.StringVar(&cfg.Metrics.CirconusCheckID, "metrics.circonus.checkid", Default.Metrics.CirconusCheckID, "Circonus Check ID")
 	f.StringVar(&cfg.Registry.Backend, "registry.backend", Default.Registry.Backend, "registry backend")
 	f.StringVar(&cfg.Registry.File.Path, "registry.file.path", Default.Registry.File.Path, "path to file based routing table")
 	f.StringVar(&cfg.Registry.Static.Routes, "registry.static.routes", Default.Registry.Static.Routes, "static routes")
@@ -211,13 +217,18 @@ func parseListen(cfg string, cs map[string]CertSource, readTimeout, writeTimeout
 
 	l = Listen{
 		Addr:         opts[0],
-		Scheme:       "http",
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 	}
 
+	var csName string
 	for k, v := range kvParse(cfg) {
 		switch k {
+		case "proto":
+			l.Proto = v
+			if l.Proto != "http" && l.Proto != "https" && l.Proto != "tcp+sni" {
+				return Listen{}, fmt.Errorf("unknown protocol %q", v)
+			}
 		case "rt": // read timeout
 			d, err := time.ParseDuration(v)
 			if err != nil {
@@ -231,14 +242,30 @@ func parseListen(cfg string, cs map[string]CertSource, readTimeout, writeTimeout
 			}
 			l.WriteTimeout = d
 		case "cs": // cert source
+			csName = v
 			c, ok := cs[v]
 			if !ok {
-				return Listen{}, fmt.Errorf("unknown certificate source %s", v)
+				return Listen{}, fmt.Errorf("unknown certificate source %q", v)
 			}
 			l.CertSource = c
-			l.Scheme = "https"
+			if l.Proto == "" {
+				l.Proto = "https"
+			}
+		case "strictmatch":
+			l.StrictMatch = (v == "true")
 		}
 	}
+
+	if l.Proto == "" {
+		l.Proto = "http"
+	}
+	if csName != "" && l.Proto != "https" {
+		return Listen{}, fmt.Errorf("cert source requires proto 'https'")
+	}
+	if csName == "" && l.Proto == "https" {
+		return Listen{}, fmt.Errorf("proto 'https' requires cert source")
+	}
+
 	return
 }
 
@@ -247,13 +274,13 @@ func parseLegacyListen(cfg string, readTimeout, writeTimeout time.Duration) (l L
 
 	l = Listen{
 		Addr:         opts[0],
-		Scheme:       "http",
+		Proto:        "http",
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 	}
 
 	if len(opts) > 1 {
-		l.Scheme = "https"
+		l.Proto = "https"
 		l.CertSource.Type = "file"
 		l.CertSource.CertPath = opts[1]
 	}

@@ -5,26 +5,27 @@ import (
 	"time"
 
 	"github.com/eBay/fabio/config"
-
-	gometrics "github.com/rcrowley/go-metrics"
+	"github.com/eBay/fabio/metrics"
 )
 
-// Proxy is a dynamic reverse proxy.
-type Proxy struct {
+// httpProxy is a dynamic reverse proxy for HTTP and HTTPS protocols.
+type httpProxy struct {
 	tr       http.RoundTripper
 	cfg      config.Proxy
-	requests gometrics.Timer
+	requests metrics.Timer
+	noroute  metrics.Counter
 }
 
-func New(tr http.RoundTripper, cfg config.Proxy) *Proxy {
-	return &Proxy{
+func NewHTTPProxy(tr http.RoundTripper, cfg config.Proxy) http.Handler {
+	return &httpProxy{
 		tr:       tr,
 		cfg:      cfg,
-		requests: gometrics.GetOrRegisterTimer("requests", gometrics.DefaultRegistry),
+		requests: metrics.DefaultRegistry.GetTimer("requests"),
+		noroute:  metrics.DefaultRegistry.GetCounter("notfound"),
 	}
 }
 
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (p *httpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if ShuttingDown() {
 		http.Error(w, "shutting down", http.StatusServiceUnavailable)
 		return
@@ -32,6 +33,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	t := target(r)
 	if t == nil {
+		p.noroute.Inc(1)
 		w.WriteHeader(p.cfg.NoRouteStatus)
 		return
 	}
