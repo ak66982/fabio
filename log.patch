@@ -1,0 +1,1106 @@
+diff -urN fabio-ak/config/config.go fabio-ak-log/config/config.go
+--- fabio-ak/config/config.go	2016-09-20 23:39:35.000781958 -0700
++++ fabio-ak-log/config/config.go	2016-09-21 01:01:37.897382272 -0700
+@@ -60,6 +60,7 @@
+ 	ClientIPHeader        string
+ 	TLSHeader             string
+ 	TLSHeaderValue        string
++	Log                   Log
+ }
+ 
+ type Runtime struct {
+@@ -67,6 +68,11 @@
+ 	GOMAXPROCS int
+ }
+ 
++type Log struct {
++	Target string
++	Format string
++}
++
+ type Metrics struct {
+ 	Target           string
+ 	Prefix           string
+diff -urN fabio-ak/config/config.go.orig fabio-ak-log/config/config.go.orig
+--- fabio-ak/config/config.go.orig	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/config/config.go.orig	2016-09-20 23:39:38.404998425 -0700
+@@ -0,0 +1,112 @@
++package config
++
++import (
++	"net/http"
++	"time"
++)
++
++type Config struct {
++	Proxy       Proxy
++	Registry    Registry
++	Listen      []Listen
++	CertSources map[string]CertSource
++	Metrics     Metrics
++	UI          UI
++	Runtime     Runtime
++
++	ListenerValue    []string
++	CertSourcesValue []map[string]string
++}
++
++type CertSource struct {
++	Name         string
++	Type         string
++	CertPath     string
++	KeyPath      string
++	ClientCAPath string
++	CAUpgradeCN  string
++	Refresh      time.Duration
++	Header       http.Header
++}
++
++type Listen struct {
++	Addr         string
++	Proto        string
++	ReadTimeout  time.Duration
++	WriteTimeout time.Duration
++	CertSource   CertSource
++	StrictMatch  bool
++}
++
++type UI struct {
++	Addr  string
++	Color string
++	Title string
++}
++
++type Proxy struct {
++	Strategy              string
++	Matcher               string
++	NoRouteStatus         int
++	MaxConn               int
++	ShutdownWait          time.Duration
++	DialTimeout           time.Duration
++	ResponseHeaderTimeout time.Duration
++	KeepAliveTimeout      time.Duration
++	ReadTimeout           time.Duration
++	WriteTimeout          time.Duration
++	FlushInterval         time.Duration
++	LocalIP               string
++	ClientIPHeader        string
++	TLSHeader             string
++	TLSHeaderValue        string
++}
++
++type Runtime struct {
++	GOGC       int
++	GOMAXPROCS int
++}
++
++type Metrics struct {
++	Target           string
++	Prefix           string
++	Names            string
++	Interval         time.Duration
++	GraphiteAddr     string
++	StatsDAddr       string
++	CirconusAPIKey   string
++	CirconusAPIApp   string
++	CirconusAPIURL   string
++	CirconusCheckID  string
++	CirconusBrokerID string
++}
++
++type Registry struct {
++	Backend string
++	Static  Static
++	File    File
++	Consul  Consul
++}
++
++type Static struct {
++	Routes string
++}
++
++type File struct {
++	Path string
++}
++
++type Consul struct {
++	Addr          string
++	Scheme        string
++	Token         string
++	KVPath        string
++	TagPrefix     string
++	Register      bool
++	ServiceAddr   string
++	ServiceName   string
++	ServiceTags   []string
++	ServiceStatus []string
++	CheckInterval time.Duration
++	CheckTimeout  time.Duration
++}
+diff -urN fabio-ak/config/load.go fabio-ak-log/config/load.go
+--- fabio-ak/config/load.go	2016-09-20 23:39:35.000781958 -0700
++++ fabio-ak-log/config/load.go	2016-09-21 01:01:37.897382272 -0700
+@@ -105,6 +105,8 @@
+ 	f.DurationVar(&cfg.Proxy.ReadTimeout, "proxy.readtimeout", Default.Proxy.ReadTimeout, "read timeout for incoming requests")
+ 	f.DurationVar(&cfg.Proxy.WriteTimeout, "proxy.writetimeout", Default.Proxy.WriteTimeout, "write timeout for outgoing responses")
+ 	f.DurationVar(&cfg.Proxy.FlushInterval, "proxy.flushinterval", Default.Proxy.FlushInterval, "flush interval for streaming responses")
++	f.StringVar(&cfg.Proxy.Log.Format, "proxy.log.format", Default.Proxy.Log.Format, "directive to change the format of logged")
++	f.StringVar(&cfg.Proxy.Log.Target, "proxy.log.target", Default.Proxy.Log.Target, "logged backend")
+ 	f.StringVar(&cfg.Metrics.Target, "metrics.target", Default.Metrics.Target, "metrics backend")
+ 	f.StringVar(&cfg.Metrics.Prefix, "metrics.prefix", Default.Metrics.Prefix, "prefix for reported metrics")
+ 	f.StringVar(&cfg.Metrics.Names, "metrics.names", Default.Metrics.Names, "route metric name template")
+diff -urN fabio-ak/config/load.go.orig fabio-ak-log/config/load.go.orig
+--- fabio-ak/config/load.go.orig	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/config/load.go.orig	2016-09-20 23:39:38.404998425 -0700
+@@ -0,0 +1,367 @@
++package config
++
++import (
++	"errors"
++	"flag"
++	"fmt"
++	"log"
++	"net/http"
++	"os"
++	"runtime"
++	"strings"
++	"time"
++
++	"github.com/magiconair/properties"
++)
++
++func Load() (cfg *Config, err error) {
++	var path string
++	for i, arg := range os.Args {
++		if arg == "-v" {
++			return nil, nil
++		}
++		path, err = parseCfg(os.Args, i)
++		if err != nil {
++			return nil, err
++		}
++		if path != "" {
++			break
++		}
++	}
++	p, err := loadProperties(path)
++	if err != nil {
++		return nil, err
++	}
++	return load(p)
++}
++
++var errInvalidConfig = errors.New("invalid or missing path to config file")
++
++func parseCfg(args []string, i int) (path string, err error) {
++	if len(args) == 0 || i >= len(args) || !strings.HasPrefix(args[i], "-cfg") {
++		return "", nil
++	}
++	arg := args[i]
++	if arg == "-cfg" {
++		if i >= len(args)-1 {
++			return "", errInvalidConfig
++		}
++		return args[i+1], nil
++	}
++
++	if !strings.HasPrefix(arg, "-cfg=") {
++		return "", errInvalidConfig
++	}
++
++	path = arg[len("-cfg="):]
++	switch {
++	case path == "":
++		return "", errInvalidConfig
++	case path[0] == '\'':
++		path = strings.Trim(path, "'")
++	case path[0] == '"':
++		path = strings.Trim(path, "\"")
++	}
++	if path == "" {
++		return "", errInvalidConfig
++	}
++	return path, nil
++}
++
++func loadProperties(path string) (p *properties.Properties, err error) {
++	if path == "" {
++		return properties.NewProperties(), nil
++	}
++	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
++		return properties.LoadURL(path)
++	}
++	return properties.LoadFile(path, properties.UTF8)
++}
++
++func load(p *properties.Properties) (cfg *Config, err error) {
++	cfg = &Config{}
++
++	f := NewFlagSet(os.Args[0], flag.ExitOnError)
++
++	// dummy values which were parsed earlier
++	f.String("cfg", "", "Path or URL to config file")
++	f.Bool("v", false, "Show version")
++
++	// config values
++	f.IntVar(&cfg.Proxy.MaxConn, "proxy.maxconn", Default.Proxy.MaxConn, "maximum number of cached connections")
++	f.StringVar(&cfg.Proxy.Strategy, "proxy.strategy", Default.Proxy.Strategy, "load balancing strategy")
++	f.StringVar(&cfg.Proxy.Matcher, "proxy.matcher", Default.Proxy.Matcher, "path matching algorithm")
++	f.IntVar(&cfg.Proxy.NoRouteStatus, "proxy.noroutestatus", Default.Proxy.NoRouteStatus, "status code for invalid route")
++	f.DurationVar(&cfg.Proxy.ShutdownWait, "proxy.shutdownwait", Default.Proxy.ShutdownWait, "time for graceful shutdown")
++	f.DurationVar(&cfg.Proxy.DialTimeout, "proxy.dialtimeout", Default.Proxy.DialTimeout, "connection timeout for backend connections")
++	f.DurationVar(&cfg.Proxy.ResponseHeaderTimeout, "proxy.responseheadertimeout", Default.Proxy.ResponseHeaderTimeout, "response header timeout")
++	f.DurationVar(&cfg.Proxy.KeepAliveTimeout, "proxy.keepalivetimeout", Default.Proxy.KeepAliveTimeout, "keep-alive timeout")
++	f.StringVar(&cfg.Proxy.LocalIP, "proxy.localip", Default.Proxy.LocalIP, "fabio address in Forward headers")
++	f.StringVar(&cfg.Proxy.ClientIPHeader, "proxy.header.clientip", Default.Proxy.ClientIPHeader, "header for the request ip")
++	f.StringVar(&cfg.Proxy.TLSHeader, "proxy.header.tls", Default.Proxy.TLSHeader, "header for TLS connections")
++	f.StringVar(&cfg.Proxy.TLSHeaderValue, "proxy.header.tls.value", Default.Proxy.TLSHeaderValue, "value for TLS connection header")
++	f.StringSliceVar(&cfg.ListenerValue, "proxy.addr", Default.ListenerValue, "listener config")
++	f.KVSliceVar(&cfg.CertSourcesValue, "proxy.cs", Default.CertSourcesValue, "certificate sources")
++	f.DurationVar(&cfg.Proxy.ReadTimeout, "proxy.readtimeout", Default.Proxy.ReadTimeout, "read timeout for incoming requests")
++	f.DurationVar(&cfg.Proxy.WriteTimeout, "proxy.writetimeout", Default.Proxy.WriteTimeout, "write timeout for outgoing responses")
++	f.DurationVar(&cfg.Proxy.FlushInterval, "proxy.flushinterval", Default.Proxy.FlushInterval, "flush interval for streaming responses")
++	f.StringVar(&cfg.Metrics.Target, "metrics.target", Default.Metrics.Target, "metrics backend")
++	f.StringVar(&cfg.Metrics.Prefix, "metrics.prefix", Default.Metrics.Prefix, "prefix for reported metrics")
++	f.StringVar(&cfg.Metrics.Names, "metrics.names", Default.Metrics.Names, "route metric name template")
++	f.DurationVar(&cfg.Metrics.Interval, "metrics.interval", Default.Metrics.Interval, "metrics reporting interval")
++	f.StringVar(&cfg.Metrics.GraphiteAddr, "metrics.graphite.addr", Default.Metrics.GraphiteAddr, "graphite server address")
++	f.StringVar(&cfg.Metrics.StatsDAddr, "metrics.statsd.addr", Default.Metrics.StatsDAddr, "statsd server address")
++	f.StringVar(&cfg.Metrics.CirconusAPIKey, "metrics.circonus.apikey", Default.Metrics.CirconusAPIKey, "Circonus API token key")
++	f.StringVar(&cfg.Metrics.CirconusAPIApp, "metrics.circonus.apiapp", Default.Metrics.CirconusAPIApp, "Circonus API token app")
++	f.StringVar(&cfg.Metrics.CirconusAPIURL, "metrics.circonus.apiurl", Default.Metrics.CirconusAPIURL, "Circonus API URL")
++	f.StringVar(&cfg.Metrics.CirconusBrokerID, "metrics.circonus.brokerid", Default.Metrics.CirconusBrokerID, "Circonus Broker ID")
++	f.StringVar(&cfg.Metrics.CirconusCheckID, "metrics.circonus.checkid", Default.Metrics.CirconusCheckID, "Circonus Check ID")
++	f.StringVar(&cfg.Registry.Backend, "registry.backend", Default.Registry.Backend, "registry backend")
++	f.StringVar(&cfg.Registry.File.Path, "registry.file.path", Default.Registry.File.Path, "path to file based routing table")
++	f.StringVar(&cfg.Registry.Static.Routes, "registry.static.routes", Default.Registry.Static.Routes, "static routes")
++	f.StringVar(&cfg.Registry.Consul.Addr, "registry.consul.addr", Default.Registry.Consul.Addr, "address of the consul agent")
++	f.StringVar(&cfg.Registry.Consul.Token, "registry.consul.token", Default.Registry.Consul.Token, "token for consul agent")
++	f.StringVar(&cfg.Registry.Consul.KVPath, "registry.consul.kvpath", Default.Registry.Consul.KVPath, "consul KV path for manual overrides")
++	f.StringVar(&cfg.Registry.Consul.TagPrefix, "registry.consul.tagprefix", Default.Registry.Consul.TagPrefix, "prefix for consul tags")
++	f.BoolVar(&cfg.Registry.Consul.Register, "registry.consul.register.enabled", Default.Registry.Consul.Register, "register fabio in consul")
++	f.StringVar(&cfg.Registry.Consul.ServiceAddr, "registry.consul.register.addr", Default.Registry.Consul.ServiceAddr, "service registration address")
++	f.StringVar(&cfg.Registry.Consul.ServiceName, "registry.consul.register.name", Default.Registry.Consul.ServiceName, "service registration name")
++	f.StringSliceVar(&cfg.Registry.Consul.ServiceTags, "registry.consul.register.tags", Default.Registry.Consul.ServiceTags, "service registration tags")
++	f.StringSliceVar(&cfg.Registry.Consul.ServiceStatus, "registry.consul.service.status", Default.Registry.Consul.ServiceStatus, "valid service status values")
++	f.DurationVar(&cfg.Registry.Consul.CheckInterval, "registry.consul.register.checkInterval", Default.Registry.Consul.CheckInterval, "service check interval")
++	f.DurationVar(&cfg.Registry.Consul.CheckTimeout, "registry.consul.register.checkTimeout", Default.Registry.Consul.CheckTimeout, "service check timeout")
++	f.IntVar(&cfg.Runtime.GOGC, "runtime.gogc", Default.Runtime.GOGC, "sets runtime.GOGC")
++	f.IntVar(&cfg.Runtime.GOMAXPROCS, "runtime.gomaxprocs", Default.Runtime.GOMAXPROCS, "sets runtime.GOMAXPROCS")
++	f.StringVar(&cfg.UI.Addr, "ui.addr", Default.UI.Addr, "address the UI/API is listening on")
++	f.StringVar(&cfg.UI.Color, "ui.color", Default.UI.Color, "background color of the UI")
++	f.StringVar(&cfg.UI.Title, "ui.title", Default.UI.Title, "optional title for the UI")
++
++	var awsApiGWCertCN string
++	f.StringVar(&awsApiGWCertCN, "aws.apigw.cert.cn", "", "deprecated. use caupgcn=<CN> for cert source")
++
++	// filter out -test flags
++	var args []string
++	for _, a := range os.Args[1:] {
++		if strings.HasPrefix(a, "-test.") {
++			continue
++		}
++		args = append(args, a)
++	}
++
++	// parse configuration
++	prefixes := []string{"FABIO_", ""}
++	if err := f.ParseFlags(args, os.Environ(), prefixes, p); err != nil {
++		return nil, err
++	}
++
++	// post configuration
++	if cfg.Runtime.GOMAXPROCS == -1 {
++		cfg.Runtime.GOMAXPROCS = runtime.NumCPU()
++	}
++
++	cfg.Registry.Consul.Scheme, cfg.Registry.Consul.Addr = parseScheme(cfg.Registry.Consul.Addr)
++
++	cfg.CertSources, err = parseCertSources(cfg.CertSourcesValue)
++	if err != nil {
++		return nil, err
++	}
++
++	cfg.Listen, err = parseListeners(cfg.ListenerValue, cfg.CertSources, cfg.Proxy.ReadTimeout, cfg.Proxy.WriteTimeout)
++	if err != nil {
++		return nil, err
++	}
++
++	// handle deprecations
++	// deprecate := func(name, msg string) {
++	// 	if f.IsSet(name) {
++	// 		log.Print("[WARN] ", msg)
++	// 	}
++	// }
++
++	return cfg, nil
++}
++
++// parseScheme splits a url into scheme and address and defaults
++// to "http" if no scheme was given.
++func parseScheme(s string) (scheme, addr string) {
++	s = strings.ToLower(s)
++	if strings.HasPrefix(s, "https://") {
++		return "https", s[len("https://"):]
++	}
++	if strings.HasPrefix(s, "http://") {
++		return "http", s[len("http://"):]
++	}
++	return "http", s
++}
++
++func parseListeners(cfgs []string, cs map[string]CertSource, readTimeout, writeTimeout time.Duration) (listen []Listen, err error) {
++	for _, cfg := range cfgs {
++		l, err := parseListen(cfg, cs, readTimeout, writeTimeout)
++		if err != nil {
++			return nil, err
++		}
++		listen = append(listen, l)
++	}
++	return
++}
++
++func parseListen(cfg string, cs map[string]CertSource, readTimeout, writeTimeout time.Duration) (l Listen, err error) {
++	if cfg == "" {
++		return Listen{}, nil
++	}
++
++	opts := strings.Split(cfg, ";")
++	if len(opts) > 1 && !strings.Contains(opts[1], "=") {
++		return parseLegacyListen(cfg, readTimeout, writeTimeout)
++	}
++
++	l = Listen{
++		Addr:         opts[0],
++		ReadTimeout:  readTimeout,
++		WriteTimeout: writeTimeout,
++	}
++
++	var csName string
++	for k, v := range kvParse(cfg) {
++		switch k {
++		case "proto":
++			l.Proto = v
++			if l.Proto != "http" && l.Proto != "https" && l.Proto != "tcp+sni" {
++				return Listen{}, fmt.Errorf("unknown protocol %q", v)
++			}
++		case "rt": // read timeout
++			d, err := time.ParseDuration(v)
++			if err != nil {
++				return Listen{}, err
++			}
++			l.ReadTimeout = d
++		case "wt": // write timeout
++			d, err := time.ParseDuration(v)
++			if err != nil {
++				return Listen{}, err
++			}
++			l.WriteTimeout = d
++		case "cs": // cert source
++			csName = v
++			c, ok := cs[v]
++			if !ok {
++				return Listen{}, fmt.Errorf("unknown certificate source %q", v)
++			}
++			l.CertSource = c
++			if l.Proto == "" {
++				l.Proto = "https"
++			}
++		case "strictmatch":
++			l.StrictMatch = (v == "true")
++		}
++	}
++
++	if l.Proto == "" {
++		l.Proto = "http"
++	}
++	if csName != "" && l.Proto != "https" {
++		return Listen{}, fmt.Errorf("cert source requires proto 'https'")
++	}
++	if csName == "" && l.Proto == "https" {
++		return Listen{}, fmt.Errorf("proto 'https' requires cert source")
++	}
++
++	return
++}
++
++func parseLegacyListen(cfg string, readTimeout, writeTimeout time.Duration) (l Listen, err error) {
++	opts := strings.Split(cfg, ";")
++
++	l = Listen{
++		Addr:         opts[0],
++		Proto:        "http",
++		ReadTimeout:  readTimeout,
++		WriteTimeout: writeTimeout,
++	}
++
++	if len(opts) > 1 {
++		l.Proto = "https"
++		l.CertSource.Type = "file"
++		l.CertSource.CertPath = opts[1]
++	}
++	if len(opts) > 2 {
++		l.CertSource.KeyPath = opts[2]
++	}
++	if len(opts) > 3 {
++		l.CertSource.ClientCAPath = opts[3]
++	}
++	if len(opts) > 4 {
++		return Listen{}, fmt.Errorf("invalid listener configuration")
++	}
++
++	log.Printf("[WARN] proxy.addr legacy configuration for certificates is deprecated. Use cs=path configuration")
++	return l, nil
++}
++
++func parseCertSources(cfgs []map[string]string) (cs map[string]CertSource, err error) {
++	cs = map[string]CertSource{}
++	for _, cfg := range cfgs {
++		src, err := parseCertSource(cfg)
++		if err != nil {
++			return nil, err
++		}
++		cs[src.Name] = src
++	}
++	return
++}
++
++func parseCertSource(cfg map[string]string) (c CertSource, err error) {
++	if cfg == nil {
++		return CertSource{}, nil
++	}
++
++	c.Refresh = 3 * time.Second
++
++	for k, v := range cfg {
++		switch k {
++		case "cs":
++			c.Name = v
++		case "type":
++			c.Type = v
++		case "cert":
++			c.CertPath = v
++		case "key":
++			c.KeyPath = v
++		case "clientca":
++			c.ClientCAPath = v
++		case "caupgcn":
++			c.CAUpgradeCN = v
++		case "refresh":
++			d, err := time.ParseDuration(v)
++			if err != nil {
++				return CertSource{}, err
++			}
++			c.Refresh = d
++		case "hdr":
++			p := strings.SplitN(v, ": ", 2)
++			if len(p) != 2 {
++				return CertSource{}, fmt.Errorf("invalid header %s", v)
++			}
++			if c.Header == nil {
++				c.Header = http.Header{}
++			}
++			c.Header.Set(p[0], p[1])
++		}
++	}
++	if c.Name == "" {
++		return CertSource{}, fmt.Errorf("missing 'cs' in %s", cfg)
++	}
++	if c.Type == "" {
++		return CertSource{}, fmt.Errorf("missing 'type' in %s", cfg)
++	}
++	if c.CertPath == "" {
++		return CertSource{}, fmt.Errorf("missing 'cert' in %s", cfg)
++	}
++	if c.Type != "file" && c.Type != "path" && c.Type != "http" && c.Type != "consul" && c.Type != "vault" {
++		return CertSource{}, fmt.Errorf("unknown cert source type %s", c.Type)
++	}
++	if c.Type == "file" {
++		c.Refresh = 0
++	}
++	return
++}
+diff -urN fabio-ak/fabio.properties fabio-ak-log/fabio.properties
+--- fabio-ak/fabio.properties	2016-09-20 23:39:35.000781958 -0700
++++ fabio-ak-log/fabio.properties	2016-09-21 01:01:37.897382272 -0700
+@@ -351,6 +351,18 @@
+ # proxy.header.tls.value =
+ 
+ 
++# proxy log configures which access logger is used.
++#
++# Example:
++#     proxy.log.target = stdout 
++#     proxy.log.format = remote_addr time request body_bytes_sent http_referer http_user_agent server_name proxy_endpoint response_time request_args http_x_forwarded_for
++#
++# The default is
++#
++# proxy.log.target =
++# proxy.log.format =
++
++
+ # registry.backend configures which backend is used.
+ # Supported backends are: consul, static, file
+ #
+diff -urN fabio-ak/logger/0-baseline.txt fabio-ak-log/logger/0-baseline.txt
+--- fabio-ak/logger/0-baseline.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/0-baseline.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1807 ns/op	      80 B/op	       6 allocs/op
++ok  	github.com/eBay/fabio/logger	1.836s
+diff -urN fabio-ak/logger/1-bytes-buffer.txt fabio-ak-log/logger/1-bytes-buffer.txt
+--- fabio-ak/logger/1-bytes-buffer.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/1-bytes-buffer.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1453 ns/op	      48 B/op	       4 allocs/op
++ok  	github.com/eBay/fabio/logger	1.479s
+diff -urN fabio-ak/logger/2-response-time.txt fabio-ak-log/logger/2-response-time.txt
+--- fabio-ak/logger/2-response-time.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/2-response-time.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1068 ns/op	      37 B/op	       4 allocs/op
++ok  	github.com/eBay/fabio/logger	1.090s
+diff -urN fabio-ak/logger/3.1-inline-time-format.txt fabio-ak-log/logger/3.1-inline-time-format.txt
+--- fabio-ak/logger/3.1-inline-time-format.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/3.1-inline-time-format.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1269 ns/op	      21 B/op	       9 allocs/op
++ok  	github.com/eBay/fabio/logger	1.293s
+diff -urN fabio-ak/logger/3.2-inline-time-format.txt fabio-ak-log/logger/3.2-inline-time-format.txt
+--- fabio-ak/logger/3.2-inline-time-format.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/3.2-inline-time-format.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1227 ns/op	      21 B/op	       9 allocs/op
++ok  	github.com/eBay/fabio/logger	1.250s
+diff -urN fabio-ak/logger/3.3-inline-time-format.txt fabio-ak-log/logger/3.3-inline-time-format.txt
+--- fabio-ak/logger/3.3-inline-time-format.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/3.3-inline-time-format.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1009 ns/op	       8 B/op	       3 allocs/op
++ok  	github.com/eBay/fabio/logger	1.030s
+diff -urN fabio-ak/logger/3.4-inline-time-format.txt fabio-ak-log/logger/3.4-inline-time-format.txt
+--- fabio-ak/logger/3.4-inline-time-format.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/3.4-inline-time-format.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 2000000	      1052 ns/op	       2 B/op	       2 allocs/op
++ok  	github.com/eBay/fabio/logger	3.059s
+diff -urN fabio-ak/logger/3.5-inline-time-format.txt fabio-ak-log/logger/3.5-inline-time-format.txt
+--- fabio-ak/logger/3.5-inline-time-format.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/3.5-inline-time-format.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 2000000	       919 ns/op	       0 B/op	       0 allocs/op
++ok  	github.com/eBay/fabio/logger	2.740s
+diff -urN fabio-ak/logger/3-inline-time-format.txt fabio-ak-log/logger/3-inline-time-format.txt
+--- fabio-ak/logger/3-inline-time-format.txt	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/3-inline-time-format.txt	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,3 @@
++PASS
++BenchmarkLog-8	 1000000	      1205 ns/op	      21 B/op	       9 allocs/op
++ok  	github.com/eBay/fabio/logger	1.229s
+diff -urN fabio-ak/logger/logger.go fabio-ak-log/logger/logger.go
+--- fabio-ak/logger/logger.go	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/logger.go	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,166 @@
++// Package logger implements a configurable access logger.
++package logger
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++)
++
++type field func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request)
++
++var fields = map[string]field{
++	"remote_addr": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		b.WriteString(r.RemoteAddr[:strings.Index(r.RemoteAddr, ":")])
++	},
++	"time": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		atoi(b, int64(t2.Year()), 4)
++		b.WriteRune('-')
++		atoi(b, int64(t2.Month()), 2)
++		b.WriteRune('-')
++		atoi(b, int64(t2.Day()), 2)
++		b.WriteRune('T')
++		atoi(b, int64(t2.Hour()), 2)
++		b.WriteRune(':')
++		atoi(b, int64(t2.Minute()), 2)
++		b.WriteRune(':')
++		atoi(b, int64(t2.Second()), 2)
++		b.WriteRune('Z')
++	},
++	"request": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		b.WriteRune('"')
++		b.WriteString(r.Method)
++		b.WriteRune(' ')
++		b.WriteString(r.RequestURI)
++		b.WriteRune(' ')
++		b.WriteString(r.Proto)
++		b.WriteRune('"')
++	},
++	"body_bytes_sent": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		atoi(b, r.ContentLength, 0)
++	},
++	"http_referer": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		b.WriteString(r.Referer())
++	},
++	"http_user_agent": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		b.WriteString(r.UserAgent())
++	},
++	"http_x_forwarded_for": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		b.WriteString(r.Header.Get("X-Forwarded-For"))
++	},
++	"server_name": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		// TODO(fs): is this correct?
++		b.WriteString(r.Host)
++	},
++	"proxy_endpoint": func(b *bytes.Buffer, t1, end time.Time, r *http.Request) {
++		// TODO(fs): is this correct?
++		b.WriteString(r.URL.Host)
++	},
++	"response_time": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		// TODO(fs): is this correct?
++		d := t2.Sub(t1).Nanoseconds()
++		s, µs := d/int64(time.Second), d%int64(time.Second)/int64(time.Microsecond)
++		atoi(b, s, 0)
++		b.WriteRune('.')
++		atoi(b, µs, 6)
++	},
++	"request_args": func(b *bytes.Buffer, t1, t2 time.Time, r *http.Request) {
++		b.WriteString(r.URL.RawQuery)
++	},
++}
++
++type Logger struct {
++	p []field
++
++	// w is the log destination
++	w io.Writer
++
++	// mu guards w
++	mu sync.Mutex
++}
++
++func New(w io.Writer, format string) (*Logger, error) {
++	p, err := parse(format)
++	if err != nil {
++		return nil, err
++	}
++	if len(p) == 0 {
++		return nil, fmt.Errorf("log: invalid format %q", format)
++	}
++	return &Logger{w: w, p: p}, nil
++}
++
++func parse(format string) (pattern []field, err error) {
++	for _, f := range strings.Fields(format) {
++		p := fields[f]
++		if p == nil {
++			return nil, fmt.Errorf("log: invalid field %q", f)
++		}
++		pattern = append(pattern, p)
++	}
++	return
++}
++
++const BufSize = 1024
++
++var pool = sync.Pool{
++	New: func() interface{} {
++		return bytes.NewBuffer(make([]byte, 0, BufSize))
++	},
++}
++
++func (l *Logger) Log(t1, t2 time.Time, r *http.Request) {
++	b := pool.Get().(*bytes.Buffer)
++	b.Reset()
++
++	for _, p := range l.p {
++		p(b, t1, t2, r)
++		b.WriteRune(' ')
++	}
++	b.Truncate(b.Len() - 1) // drop last space
++	b.WriteRune('\n')
++
++	l.mu.Lock()
++	l.w.Write(b.Bytes())
++	l.mu.Unlock()
++	pool.Put(b)
++}
++
++// atoi is a replacement for strconv.Atoi/strconv.FormatInt
++// which does not alloc.
++func atoi(b *bytes.Buffer, i int64, pad int) {
++	var flag bool
++	if i < 0 {
++		flag = true
++		i = -i
++	}
++
++	// format number
++	// 2^63-1 == 9223372036854775807
++	var d [128]byte
++	n, p := len(d), len(d)-1
++	for i >= 0 {
++		d[p] = byte('0') + byte(i%10)
++		i /= 10
++		p--
++		if i == 0 {
++			break
++		}
++	}
++
++	// padding
++	for n-p-1 < pad {
++		d[p] = byte('0')
++		p--
++	}
++
++	if flag {
++		d[p] = '-'
++		p--
++	}
++	b.Write(d[p+1:])
++}
+diff -urN fabio-ak/logger/logger_test.go fabio-ak-log/logger/logger_test.go
+--- fabio-ak/logger/logger_test.go	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/logger/logger_test.go	2016-09-21 01:04:26.286288579 -0700
+@@ -0,0 +1,125 @@
++package logger
++
++import (
++	"bytes"
++	"io/ioutil"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"testing"
++	"time"
++)
++
++func TestLog(t *testing.T) {
++	t1 := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
++	t2 := t1.Add(123456 * time.Microsecond)
++
++	req := &http.Request{
++		RequestURI: "/?q=x",
++		Header: http.Header{
++			"User-Agent":      {"Mozilla Firefox"},
++			"X-Forwarded-For": {"3.3.3.3"},
++		},
++		RemoteAddr: "2.2.2.2:666",
++		Host:       "server host",
++		URL: &url.URL{
++			Host: "proxy host",
++		},
++		Method: "GET",
++		Proto:  "HTTP/1.1",
++	}
++
++	tests := []struct {
++		format string
++		out    string
++	}{
++		{"remote_addr", "2.2.2.2\n"},
++		{"time", "2016-01-01T00:00:00Z\n"},
++		//{"request", "\"GET /?q=x HTTP/1.1\"\n"},
++		{"body_bytes_sent", "0\n"},
++		{"http_referer", "\n"},
++		{"http_user_agent", "Mozilla Firefox\n"},
++		{"http_x_forwarded_for", "3.3.3.3\n"},
++		{"server_name", "server host\n"},   // TODO(fs): is this correct?
++		{"proxy_endpoint", "proxy host\n"}, // TODO(fs): is this correct?
++		{"response_time", "0.123456\n"},    // TODO(fs): is this correct?
++		//{"request_args", "?q=x\n"},
++	}
++
++	for i, tt := range tests {
++		b := new(bytes.Buffer)
++
++		l, err := New(b, tt.format)
++		if err != nil {
++			t.Fatalf("%d: got %v want nil", i, err)
++		}
++
++		l.Log(t1, t2, req)
++
++		if got, want := string(b.Bytes()), tt.out; got != want {
++			t.Errorf("%d: got %q want %q", i, got, want)
++		}
++	}
++}
++
++func TestAtoi(t *testing.T) {
++	tests := []struct {
++		i   int64
++		pad int
++		s   string
++	}{
++		{i: 0, pad: 0, s: "0"},
++		{i: 1, pad: 0, s: "1"},
++		{i: -1, pad: 0, s: "-1"},
++		{i: 12345, pad: 0, s: "12345"},
++		{i: -12345, pad: 0, s: "-12345"},
++		{i: 9223372036854775807, pad: 0, s: "9223372036854775807"},
++		{i: -9223372036854775807, pad: 0, s: "-9223372036854775807"},
++
++		{i: 0, pad: 5, s: "00000"},
++		{i: 1, pad: 5, s: "00001"},
++		{i: -1, pad: 5, s: "-00001"},
++		{i: 12345, pad: 5, s: "12345"},
++		{i: -12345, pad: 5, s: "-12345"},
++		{i: 9223372036854775807, pad: 5, s: "9223372036854775807"},
++		{i: -9223372036854775807, pad: 5, s: "-9223372036854775807"},
++	}
++
++	for i, tt := range tests {
++		var b bytes.Buffer
++		atoi(&b, tt.i, tt.pad)
++		if got, want := string(b.Bytes()), tt.s; got != want {
++			t.Errorf("%d: got %q want %q", i, got, want)
++		}
++	}
++}
++
++func BenchmarkLog(b *testing.B) {
++	t1 := time.Date(2016, 1, 1, 0, 0, 0, 0, time.UTC)
++	t2 := t1.Add(100 * time.Millisecond)
++	req := &http.Request{
++		RequestURI: "/",
++		Header:     http.Header{"X-Forwarded-For": {"3.3.3.3"}},
++		RemoteAddr: "2.2.2.2:666",
++		URL:        &url.URL{},
++		Method:     "GET",
++		Proto:      "HTTP/1.1",
++	}
++
++	var keys []string
++	for k := range fields {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	format := strings.Join(keys, " ")
++
++	l, err := New(ioutil.Discard, format)
++	if err != nil {
++		b.Fatal(err)
++	}
++
++	for i := 0; i < b.N; i++ {
++		l.Log(t1, t2, req)
++	}
++}
+diff -urN fabio-ak/proxy/logger.go fabio-ak-log/proxy/logger.go
+--- fabio-ak/proxy/logger.go	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/proxy/logger.go	2016-09-21 01:01:37.897382272 -0700
+@@ -0,0 +1,26 @@
++package proxy
++
++import (
++	"fmt"
++	"github.com/eBay/fabio/logger"
++	"io"
++	"log"
++	"os"
++)
++
++func newLogger(target string, format string) (*logger.Logger, error) {
++	var w io.Writer
++
++	switch target {
++	case "stdout":
++		log.Printf("[INFO] Output logger to stdout")
++		w = os.Stdout
++	case "":
++		log.Printf("[INFO] Logger disabled")
++		return nil, nil
++	default:
++		return nil, fmt.Errorf("Invalid Logger target %s", target)
++	}
++
++	return logger.New(w, format)
++}
+diff -urN fabio-ak/proxy/proxy.go fabio-ak-log/proxy/proxy.go
+--- fabio-ak/proxy/proxy.go	2016-09-20 23:39:35.004782212 -0700
++++ fabio-ak-log/proxy/proxy.go	2016-09-21 01:04:26.286288579 -0700
+@@ -3,9 +3,10 @@
+ import (
+ 	"net/http"
+ 	"time"
+-
++	"log"
+ 	"github.com/eBay/fabio/config"
+ 	"github.com/eBay/fabio/metrics"
++	"github.com/eBay/fabio/logger"
+ )
+ 
+ // httpProxy is a dynamic reverse proxy for HTTP and HTTPS protocols.
+@@ -14,14 +15,23 @@
+ 	cfg      config.Proxy
+ 	requests metrics.Timer
+ 	noroute  metrics.Counter
++	logger   *logger.Logger
+ }
+ 
+ func NewHTTPProxy(tr http.RoundTripper, cfg config.Proxy) http.Handler {
++
++	logger, err := newLogger(cfg.Log.Target, cfg.Log.Format)
++
++	if err != nil {
++		log.Fatal("[FATAL] ", err)
++	}
++
+ 	return &httpProxy{
+ 		tr:       tr,
+ 		cfg:      cfg,
+ 		requests: metrics.DefaultRegistry.GetTimer("requests"),
+ 		noroute:  metrics.DefaultRegistry.GetCounter("notfound"),
++		logger:   logger,
+ 	}
+ }
+ 
+@@ -64,4 +74,7 @@
+ 	h.ServeHTTP(w, r)
+ 	p.requests.UpdateSince(start)
+ 	t.Timer.UpdateSince(start)
++	if p.logger != nil {
++		p.logger.Log(start, time.Now(), r)
++	}
+ }
+diff -urN fabio-ak/proxy/proxy.go.orig fabio-ak-log/proxy/proxy.go.orig
+--- fabio-ak/proxy/proxy.go.orig	1969-12-31 16:00:00.000000000 -0800
++++ fabio-ak-log/proxy/proxy.go.orig	2016-09-21 01:04:11.985540067 -0700
+@@ -0,0 +1,80 @@
++package proxy
++
++import (
++	"net/http"
++	"time"
++	"log"
++	"github.com/eBay/fabio/config"
++	"github.com/eBay/fabio/metrics"
++	"github.com/eBay/fabio/logger"
++)
++
++// httpProxy is a dynamic reverse proxy for HTTP and HTTPS protocols.
++type httpProxy struct {
++	tr       http.RoundTripper
++	cfg      config.Proxy
++	requests metrics.Timer
++	noroute  metrics.Counter
++	logger   *logger.Logger
++}
++
++func NewHTTPProxy(tr http.RoundTripper, cfg config.Proxy) http.Handler {
++
++	logger, err := newLogger(cfg.Log.Target, cfg.Log.Format)
++
++	if err != nil {
++		log.Fatal("[FATAL] ", err)
++	}
++
++	return &httpProxy{
++		tr:       tr,
++		cfg:      cfg,
++		requests: metrics.DefaultRegistry.GetTimer("requests"),
++		noroute:  metrics.DefaultRegistry.GetCounter("notfound"),
++		logger:   logger,
++	}
++}
++
++func (p *httpProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	if ShuttingDown() {
++		http.Error(w, "shutting down", http.StatusServiceUnavailable)
++		return
++	}
++
++	t := target(r)
++	if t == nil {
++		p.noroute.Inc(1)
++		w.WriteHeader(p.cfg.NoRouteStatus)
++		return
++	}
++
++	if err := addHeaders(r, p.cfg); err != nil {
++		http.Error(w, "cannot parse "+r.RemoteAddr, http.StatusInternalServerError)
++		return
++	}
++
++	var h http.Handler
++	switch {
++	case r.Header.Get("Upgrade") == "websocket":
++		h = newRawProxy(t.URL)
++
++		// To use the filtered proxy use
++		// h = newWSProxy(t.URL)
++
++	case r.Header.Get("Accept") == "text/event-stream":
++		// use the flush interval for SSE (server-sent events)
++		// must be > 0s to be effective
++		h = newHTTPProxy(t.URL, p.tr, p.cfg.FlushInterval)
++
++	default:
++		h = newHTTPProxy(t.URL, p.tr, time.Duration(0))
++	}
++
++	start := time.Now()
++	h.ServeHTTP(w, r)
++	p.requests.UpdateSince(start)
++	t.Timer.UpdateSince(start)
++	if p.logger != nil {
++		p.logger.Log(start, r)
++	}
++}
+diff -urN fabio-ak/proxy/proxy_integration_test.go fabio-ak-log/proxy/proxy_integration_test.go
+--- fabio-ak/proxy/proxy_integration_test.go	2016-09-20 23:39:35.004782212 -0700
++++ fabio-ak-log/proxy/proxy_integration_test.go	2016-09-21 01:01:37.897382272 -0700
+@@ -55,3 +55,35 @@
+ 		t.Fatalf("got %d want %d", got, want)
+ 	}
+ }
++
++func BenchmarkProxyLogger(b *testing.B) {
++	got := "not called"
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		got = r.Header.Get("X-Forwarded-For")
++	}))
++	defer server.Close()
++
++	table := make(route.Table)
++	table.AddRoute("mock", "/", server.URL, 1, nil)
++	route.SetTable(table)
++
++	tr := &http.Transport{Dial: (&net.Dialer{}).Dial}
++	proxy := New(tr, config.Proxy{LocalIP: "1.1.1.1", ClientIPHeader: "X-Forwarded-For", Log: config.Log{
++		Format: "remote_addr time request body_bytes_sent http_referer http_user_agent server_name proxy_endpoint response_time request_args ",
++		Target: "stdout",
++	}})
++
++	req := &http.Request{
++		RequestURI: "/",
++		Header:     http.Header{"X-Forwarded-For": {"1.2.3.4"}},
++		RemoteAddr: "2.2.2.2:666",
++		URL:        &url.URL{},
++		Method:     "GET",
++		Proto:      "HTTP/1.1",
++	}
++
++	for i := 0; i < b.N; i++ {
++		proxy.ServeHTTP(httptest.NewRecorder(), req)
++	}
++
++}
